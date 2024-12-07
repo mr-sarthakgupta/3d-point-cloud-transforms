@@ -1,157 +1,229 @@
 import torch
 import numpy as np
-import pytorch3d
-from pytorch3d.structures import Pointclouds
-from pytorch3d.ops import estimate_pointcloud_normals
-import open3d as o3d
 
-def load_ply_to_pytorch3d(file_path):
+def load_ply(file_path):
     """
-    Load a .ply file and convert it to a PyTorch3D Pointclouds object.
+    Load a .ply file manually without using Open3D.
     
     Args:
         file_path (str): Path to the .ply file
     
     Returns:
-        Pointclouds: PyTorch3D point cloud object
-        torch.Tensor: Original point cloud as a tensor
+        torch.Tensor: Point cloud points
     """
-    # Use Open3D to read the PLY file
-    pcd = o3d.io.read_point_cloud(file_path)
-    points = np.asarray(pcd.points)
+    def parse_ply_header(file):
+        # Read header
+        header_lines = []
+        while True:
+            line = file.readline().decode('utf-8').strip()
+            header_lines.append(line)
+            if line == 'end_header':
+                break
+        
+        # Find vertex count and data start
+        vertex_count = None
+        for line in header_lines:
+            if line.startswith('element vertex'):
+                vertex_count = int(line.split()[-1])
+        
+        return vertex_count
+    
+    # Open file in binary mode
+    with open(file_path, 'rb') as f:
+        # Parse header
+        vertex_count = parse_ply_header(f)
+        
+        # Read point cloud data
+        dtype = np.dtype([
+            ('x', 'float32'),
+            ('y', 'float32'),
+            ('z', 'float32'),
+            ('nx', 'float32', (3,)),  # Optional: normals
+            ('color', 'uint8', (3,))  # Optional: colors
+        ])
+        
+        # Read point data
+        point_data = np.fromfile(f, dtype=dtype, count=vertex_count)
+        
+        # Extract xyz coordinates
+        points = np.column_stack((
+            point_data['x'], 
+            point_data['y'], 
+            point_data['z']
+        ))
     
     # Convert to PyTorch tensor
-    points_tensor = torch.from_numpy(points).float()
-    
-    # Create PyTorch3D Pointclouds object
-    pointcloud = Pointclouds(points=[points_tensor])
-    
-    return pointcloud, points_tensor
+    return torch.from_numpy(points).float()
 
-def detect_floor_plane(points):
+def estimate_plane_ransac(points, num_iterations=100, threshold=0.01):
     """
-    Detect the floor plane using RANSAC plane estimation.
+    Estimate floor plane using RANSAC.
     
     Args:
-        points (torch.Tensor): Point cloud points
+        points (torch.Tensor): Input point cloud
+        num_iterations (int): Number of RANSAC iterations
+        threshold (float): Inlier threshold
     
     Returns:
-        torch.Tensor: Plane normal vector
-        torch.Tensor: A point on the plane
+        torch.Tensor: Plane normal
+        torch.Tensor: Point on the plane
     """
-    # Estimate point cloud normals
-    normals = estimate_pointcloud_normals(points.unsqueeze(0), k=10)
-    normals = normals.squeeze()
+    best_normal = None
+    max_inliers = 0
     
-    # Find the most common normal direction (likely floor normal)
-    unique_normals, counts = torch.unique(torch.round(normals * 10) / 10, dim=0, return_counts=True)
-    floor_normal = unique_normals[torch.argmax(counts)]
+    for _ in range(num_iterations):
+        # Randomly sample 3 points to define a plane
+        indices = torch.randperm(len(points))[:3]
+        sample_points = points[indices]
+        
+        # Compute plane normal using cross product
+        v1 = sample_points[1] - sample_points[0]
+        v2 = sample_points[2] - sample_points[0]
+        normal = torch.cross(v1, v2)
+        normal = normal / torch.norm(normal)
+        
+        # Compute distance of each point to the plane
+        # Plane equation: dot(normal, x - point_on_plane) = 0
+        distances = torch.abs(torch.mm(points - sample_points[0], normal.unsqueeze(1)).squeeze())
+        
+        # Count inliers
+        inliers = (distances < threshold)
+        num_inliers = inliers.sum()
+        
+        # Update best plane if more inliers found
+        if num_inliers > max_inliers:
+            max_inliers = num_inliers
+            best_normal = normal
+            best_point = sample_points[0]
     
-    # Find a point on the plane (average of points with similar normal)
-    normal_dot_products = torch.abs(torch.mm(normals, floor_normal.unsqueeze(1)).squeeze())
-    plane_points_mask = normal_dot_products > 0.9
-    plane_point = points[plane_points_mask].mean(dim=0)
-    
-    return floor_normal, plane_point
+    return best_normal, best_point
 
-def reorient_point_cloud(points, floor_normal, plane_point):
+def compute_rotation_matrix(current_normal, target_normal):
     """
-    Reorient point cloud so that floor is on YZ plane at y=0.
+    Compute rotation matrix to align current normal with target normal.
     
     Args:
-        points (torch.Tensor): Original point cloud
-        floor_normal (torch.Tensor): Normal vector of the floor plane
-        plane_point (torch.Tensor): A point on the floor plane
+        current_normal (torch.Tensor): Current plane normal
+        target_normal (torch.Tensor): Target normal (typically [0, 1, 0])
     
     Returns:
-        torch.Tensor: Reoriented point cloud
+        torch.Tensor: 3x3 rotation matrix
     """
-    # Normalize the floor normal
-    floor_normal = floor_normal / torch.norm(floor_normal)
+    # Normalize input vectors
+    current_normal = current_normal / torch.norm(current_normal)
+    target_normal = target_normal / torch.norm(target_normal)
     
-    # Calculate rotation to align floor normal with [0, 1, 0]
-    target_normal = torch.tensor([0., 1., 0.], device=points.device)
+    # Compute rotation axis (cross product)
+    rot_axis = torch.cross(current_normal, target_normal)
     
-    # Cross product to get rotation axis
-    rot_axis = torch.cross(floor_normal, target_normal)
+    # If normals are parallel, return identity matrix
+    if torch.norm(rot_axis) < 1e-6:
+        return torch.eye(3, dtype=current_normal.dtype, device=current_normal.device)
+    
     rot_axis = rot_axis / torch.norm(rot_axis)
     
-    # Calculate rotation angle
-    cos_theta = torch.dot(floor_normal, target_normal)
+    # Compute rotation angle
+    cos_theta = torch.dot(current_normal, target_normal)
     theta = torch.arccos(cos_theta)
     
-    # Create rotation matrix using Rodriguez rotation formula
+    # Rodrigues' rotation formula
     K = torch.tensor([
         [0, -rot_axis[2], rot_axis[1]],
         [rot_axis[2], 0, -rot_axis[0]],
         [-rot_axis[1], rot_axis[0], 0]
-    ], device=points.device)
+    ], device=current_normal.device, dtype=current_normal.dtype)
     
-    I = torch.eye(3, device=points.device)
+    I = torch.eye(3, device=current_normal.device, dtype=current_normal.dtype)
     R = I + torch.sin(theta) * K + (1 - cos_theta) * torch.mm(K, K)
+    
+    return R
+
+def reorient_point_cloud(points, floor_normal, floor_point):
+    """
+    Reorient point cloud to place floor on YZ plane.
+    
+    Args:
+        points (torch.Tensor): Input point cloud
+        floor_normal (torch.Tensor): Estimated floor normal
+        floor_point (torch.Tensor): A point on the floor plane
+    
+    Returns:
+        torch.Tensor: Reoriented point cloud
+    """
+    # Target normal (floor will be aligned with Y-axis)
+    target_normal = torch.tensor([0., 1., 0.], device=points.device)
+    
+    # Compute rotation matrix
+    R = compute_rotation_matrix(floor_normal, target_normal)
     
     # Rotate points
     rotated_points = torch.mm(points, R.T)
     
-    # Translate to center on y=0 plane
-    z_mean = rotated_points[:, 2].mean()
+    # Center the point cloud on YZ plane
     x_mean = rotated_points[:, 0].mean()
+    z_mean = rotated_points[:, 2].mean()
     
-    translated_points = rotated_points.clone()
-    translated_points[:, 2] -= z_mean
-    translated_points[:, 0] -= x_mean
+    # Translate points
+    centered_points = rotated_points.clone()
+    centered_points[:, 0] -= x_mean
+    centered_points[:, 2] -= z_mean
     
-    return translated_points
+    return centered_points
 
-def process_point_cloud(file_path):
+def save_ply(points, output_path):
     """
-    Main processing function to load, detect floor, and reorient point cloud.
+    Save point cloud to a .ply file manually.
     
     Args:
-        file_path (str): Path to the input .ply file
+        points (torch.Tensor): Point cloud to save
+        output_path (str): Output file path
+    """
+    # Convert to NumPy
+    points_np = points.numpy()
     
-    Returns:
-        torch.Tensor: Reoriented point cloud
-        torch.Tensor: Original point cloud
+    # Open file for writing
+    with open(output_path, 'wb') as f:
+        # Write PLY header
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {len(points_np)}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "end_header\n"
+        )
+        f.write(header.encode('utf-8'))
+        
+        # Write point data
+        points_np.astype('<f4').tofile(f)
+
+def process_point_cloud(input_path, output_path):
+    """
+    Main processing function.
+    
+    Args:
+        input_path (str): Input .ply file path
+        output_path (str): Output .ply file path
     """
     # Load point cloud
-    pointcloud, points = load_ply_to_pytorch3d(file_path)
+    points = load_ply(input_path)
     
-    # Detect floor plane
-    floor_normal, plane_point = detect_floor_plane(points)
+    # Estimate floor plane
+    floor_normal, floor_point = estimate_plane_ransac(points)
     
     # Reorient point cloud
-    reoriented_points = reorient_point_cloud(points, floor_normal, plane_point)
+    reoriented_points = reorient_point_cloud(points, floor_normal, floor_point)
     
-    return reoriented_points, points
-
-def save_reoriented_point_cloud(reoriented_points, output_path):
-    """
-    Save reoriented point cloud to a .ply file.
+    # Save reoriented point cloud
+    save_ply(reoriented_points, output_path)
     
-    Args:
-        reoriented_points (torch.Tensor): Reoriented point cloud
-        output_path (str): Path to save the output .ply file
-    """
-    # Convert to numpy for Open3D
-    points_np = reoriented_points.numpy()
-    
-    # Create Open3D point cloud
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_np)
-    
-    # Save to file
-    o3d.io.write_point_cloud(output_path, pcd)
+    print(f"Processed point cloud saved to {output_path}")
+    print(f"Estimated floor normal: {floor_normal}")
 
 # Example usage
 if __name__ == "__main__":
     input_file = "plyfiles/shoe_pc.ply"
-    output_file = "result_plyfiles/shoe_pc.ply"
+    output_file = "output_plyfiles/shoe_pc.ply"
     
-    # Process point cloud
-    reoriented_points, original_points = process_point_cloud(input_file)
-    
-    # Save reoriented point cloud
-    save_reoriented_point_cloud(reoriented_points, output_file)
-    
-    print(f"Reoriented point cloud saved to {output_file}")
+    process_point_cloud(input_file, output_file)
