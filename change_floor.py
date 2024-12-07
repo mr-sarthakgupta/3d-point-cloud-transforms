@@ -1,229 +1,103 @@
-import torch
 import numpy as np
+import open3d as o3d
+from scipy.optimize import minimize
 
-def load_ply(file_path):
+def fit_plane_ransac(points, max_iterations=1000, threshold=0.01):
     """
-    Load a .ply file manually without using Open3D.
+    Use RANSAC to robustly fit a plane to the point cloud
     
     Args:
-        file_path (str): Path to the .ply file
+        points (np.ndarray): Input point cloud points
+        max_iterations (int): Maximum RANSAC iterations
+        threshold (float): Distance threshold for inliers
     
     Returns:
-        torch.Tensor: Point cloud points
+        tuple: Plane normal and point on the plane
     """
-    def parse_ply_header(file):
-        # Read header
-        header_lines = []
-        while True:
-            line = file.readline().decode('utf-8').strip()
-            header_lines.append(line)
-            if line == 'end_header':
-                break
-        
-        # Find vertex count and data start
-        vertex_count = None
-        for line in header_lines:
-            if line.startswith('element vertex'):
-                vertex_count = int(line.split()[-1])
-        
-        return vertex_count
-    
-    # Open file in binary mode
-    with open(file_path, 'rb') as f:
-        # Parse header
-        vertex_count = parse_ply_header(f)
-        
-        # Read point cloud data
-        dtype = np.dtype([
-            ('x', 'float32'),
-            ('y', 'float32'),
-            ('z', 'float32'),
-            ('nx', 'float32', (3,)),  # Optional: normals
-            ('color', 'uint8', (3,))  # Optional: colors
-        ])
-        
-        # Read point data
-        point_data = np.fromfile(f, dtype=dtype, count=vertex_count)
-        
-        # Extract xyz coordinates
-        points = np.column_stack((
-            point_data['x'], 
-            point_data['y'], 
-            point_data['z']
-        ))
-    
-    # Convert to PyTorch tensor
-    return torch.from_numpy(points).float()
-
-def estimate_plane_ransac(points, num_iterations=100, threshold=0.01):
-    """
-    Estimate floor plane using RANSAC.
-    
-    Args:
-        points (torch.Tensor): Input point cloud
-        num_iterations (int): Number of RANSAC iterations
-        threshold (float): Inlier threshold
-    
-    Returns:
-        torch.Tensor: Plane normal
-        torch.Tensor: Point on the plane
-    """
-    best_normal = None
+    best_plane = None
     max_inliers = 0
     
-    for _ in range(num_iterations):
-        # Randomly sample 3 points to define a plane
-        indices = torch.randperm(len(points))[:3]
-        sample_points = points[indices]
+    for _ in range(max_iterations):
+        # Randomly select 3 points
+        sample_indices = np.random.choice(len(points), 3, replace=False)
+        sample_points = points[sample_indices]
         
-        # Compute plane normal using cross product
+        # Compute plane normal
         v1 = sample_points[1] - sample_points[0]
         v2 = sample_points[2] - sample_points[0]
-        normal = torch.cross(v1, v2)
-        normal = normal / torch.norm(normal)
+        normal = np.cross(v1, v2)
+        normal /= np.linalg.norm(normal)
         
         # Compute distance of each point to the plane
-        # Plane equation: dot(normal, x - point_on_plane) = 0
-        distances = torch.abs(torch.mm(points - sample_points[0], normal.unsqueeze(1)).squeeze())
+        distances = np.abs(np.dot(points - sample_points[0], normal))
         
         # Count inliers
-        inliers = (distances < threshold)
-        num_inliers = inliers.sum()
+        inliers = np.sum(distances < threshold)
         
-        # Update best plane if more inliers found
-        if num_inliers > max_inliers:
-            max_inliers = num_inliers
-            best_normal = normal
-            best_point = sample_points[0]
+        if inliers > max_inliers:
+            max_inliers = inliers
+            best_plane = (normal, sample_points[0])
     
-    return best_normal, best_point
+    return best_plane
 
-def compute_rotation_matrix(current_normal, target_normal):
+def detect_and_reorient_floor(ply_path):
     """
-    Compute rotation matrix to align current normal with target normal.
+    Detect the floor plane in a point cloud and reorient it to the YZ plane centered at origin.
     
     Args:
-        current_normal (torch.Tensor): Current plane normal
-        target_normal (torch.Tensor): Target normal (typically [0, 1, 0])
+        ply_path (str): Path to the input .ply file
     
     Returns:
-        torch.Tensor: 3x3 rotation matrix
+        o3d.geometry.PointCloud: Reoriented point cloud
     """
-    # Normalize input vectors
-    current_normal = current_normal / torch.norm(current_normal)
-    target_normal = target_normal / torch.norm(target_normal)
+    # Load the point cloud
+    pcd = o3d.io.read_point_cloud(ply_path)
+    points = np.asarray(pcd.points)
     
-    # Compute rotation axis (cross product)
-    rot_axis = torch.cross(current_normal, target_normal)
+    # Detect floor plane using RANSAC
+    floor_normal, plane_point = fit_plane_ransac(points)
     
-    # If normals are parallel, return identity matrix
-    if torch.norm(rot_axis) < 1e-6:
-        return torch.eye(3, dtype=current_normal.dtype, device=current_normal.device)
+    # Ensure floor normal points upwards 
+    if floor_normal[1] < 0:
+        floor_normal = -floor_normal
     
-    rot_axis = rot_axis / torch.norm(rot_axis)
+    # Create rotation matrix to align floor normal with [0, 1, 0]
+    target_up = np.array([0, 1, 0])
     
-    # Compute rotation angle
-    cos_theta = torch.dot(current_normal, target_normal)
-    theta = torch.arccos(cos_theta)
+    # Compute rotation axis and angle
+    rotation_axis = np.cross(floor_normal, target_up)
+    rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)
     
-    # Rodrigues' rotation formula
-    K = torch.tensor([
-        [0, -rot_axis[2], rot_axis[1]],
-        [rot_axis[2], 0, -rot_axis[0]],
-        [-rot_axis[1], rot_axis[0], 0]
-    ], device=current_normal.device, dtype=current_normal.dtype)
+    angle = np.arccos(np.dot(floor_normal, target_up))
     
-    I = torch.eye(3, device=current_normal.device, dtype=current_normal.dtype)
-    R = I + torch.sin(theta) * K + (1 - cos_theta) * torch.mm(K, K)
+    # Create rotation matrix
+    R = o3d.geometry.get_rotation_matrix_from_axis_angle(rotation_axis * angle)
     
-    return R
+    # Apply rotation
+    pcd.rotate(R, center=(0,0,0))
+    
+    # Recompute points after rotation
+    points_rotated = np.asarray(pcd.points)
+    
+    # Find the lowest point on the Y-axis to shift
+    min_y = np.min(points_rotated[:, 1])
+    
+    # Translate to ensure floor is exactly at y=0
+    translation = np.array([0, -min_y, 0])
+    pcd.translate(translation)
+    
+    return pcd
 
-def reorient_point_cloud(points, floor_normal, floor_point):
-    """
-    Reorient point cloud to place floor on YZ plane.
+def main():
+    # Example usage
+    ply_file_path = 'plyfiles/shoe_pc.ply'  # Replace with your .ply file path
+    reoriented_pcd = detect_and_reorient_floor(ply_file_path)
     
-    Args:
-        points (torch.Tensor): Input point cloud
-        floor_normal (torch.Tensor): Estimated floor normal
-        floor_point (torch.Tensor): A point on the floor plane
+    # Visualize the result
+    o3d.visualization.draw_geometries([reoriented_pcd])
     
-    Returns:
-        torch.Tensor: Reoriented point cloud
-    """
-    # Target normal (floor will be aligned with Y-axis)
-    target_normal = torch.tensor([0., 1., 0.], device=points.device)
-    
-    # Compute rotation matrix
-    R = compute_rotation_matrix(floor_normal, target_normal)
-    
-    # Rotate points
-    rotated_points = torch.mm(points, R.T)
-    
-    # Center the point cloud on YZ plane
-    x_mean = rotated_points[:, 0].mean()
-    z_mean = rotated_points[:, 2].mean()
-    
-    # Translate points
-    centered_points = rotated_points.clone()
-    centered_points[:, 0] -= x_mean
-    centered_points[:, 2] -= z_mean
-    
-    return centered_points
+    # Save the reoriented point cloud
+    o3d.io.write_point_cloud('reoriented_shoe.ply', reoriented_pcd)
 
-def save_ply(points, output_path):
-    """
-    Save point cloud to a .ply file manually.
-    
-    Args:
-        points (torch.Tensor): Point cloud to save
-        output_path (str): Output file path
-    """
-    # Convert to NumPy
-    points_np = points.numpy()
-    
-    # Open file for writing
-    with open(output_path, 'wb') as f:
-        # Write PLY header
-        header = (
-            "ply\n"
-            "format binary_little_endian 1.0\n"
-            f"element vertex {len(points_np)}\n"
-            "property float x\n"
-            "property float y\n"
-            "property float z\n"
-            "end_header\n"
-        )
-        f.write(header.encode('utf-8'))
-        
-        # Write point data
-        points_np.astype('<f4').tofile(f)
-
-def process_point_cloud(input_path, output_path):
-    """
-    Main processing function.
-    
-    Args:
-        input_path (str): Input .ply file path
-        output_path (str): Output .ply file path
-    """
-    # Load point cloud
-    points = load_ply(input_path)
-    
-    # Estimate floor plane
-    floor_normal, floor_point = estimate_plane_ransac(points)
-    
-    # Reorient point cloud
-    reoriented_points = reorient_point_cloud(points, floor_normal, floor_point)
-    
-    # Save reoriented point cloud
-    save_ply(reoriented_points, output_path)
-    
-    print(f"Processed point cloud saved to {output_path}")
-    print(f"Estimated floor normal: {floor_normal}")
-
-# Example usage
-if __name__ == "__main__":
-    input_file = "plyfiles/shoe_pc.ply"
-    output_file = "output_plyfiles/shoe_pc.ply"
-    
-    process_point_cloud(input_file, output_file)
+if __name__ == '__main__':
+    main()
