@@ -1,3 +1,4 @@
+import os
 import open3d as o3d
 import numpy as np
 
@@ -100,4 +101,5 @@ def main(ply_file_path):
         visualize_reconstructed_surface(mesh)
 
 # Example usage
-main('plyfiles/shoe_pc.ply')
+for filename in os.listdir('plyfiles'):
+    main(f'plyfiles/{filename}')

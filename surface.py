@@ -257,6 +257,7 @@
 
 #########################################################################################################################################################
 
+import os
 import numpy as np
 import open3d as o3d
 import scipy.spatial
@@ -358,9 +359,9 @@ def reconstruct_surface_memory_efficient(point_cloud, method='poisson', depth=8)
     
     return mesh
 
-def main():
+def main(filename):
     # Load the point cloud
-    ply_file_path = 'reoriented_shoe.ply'
+    ply_file_path = f'plyfiles/{filename}'
     point_cloud = o3d.io.read_point_cloud(ply_file_path)
     
     # Print point cloud information
@@ -375,8 +376,9 @@ def main():
     o3d.visualization.draw_geometries([ball_pivoting_mesh])
     
     # Save reconstructed meshes
-    o3d.io.write_triangle_mesh('poisson_mesh.ply', poisson_mesh)
-    o3d.io.write_triangle_mesh('ball_pivoting_mesh.ply', ball_pivoting_mesh)
+    o3d.io.write_triangle_mesh(f'poisson_plyfiles/{filename}', poisson_mesh)
+    o3d.io.write_triangle_mesh(f'ball_pivot_plyfiles/{filename}', ball_pivoting_mesh)
 
 if __name__ == '__main__':
-    main()
+    for filename in os.listdir('plyfiles'):
+        main(filename)
