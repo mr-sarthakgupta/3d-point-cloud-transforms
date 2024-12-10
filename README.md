@@ -8,3 +8,11 @@ The point cloud `.ply` files are organized as follows:
 - `floors` contains the point clouds of the floors extracted using `align_point_cloud_to_floor` function from `reorient_floor.py`
 - `reoriented_plyfiles` contains all the reoriented point clouds with their floors coincinding with `y = 0` and centered at the origin
 - `smooth_plyfiles` contains three subdirectories, each corresponding to a different representation generated using `surface_smoothing.py`
+
+Also, the file `test_reoriemt_floor.py` tests the algorithm for finding and rotating the floor to the desired orientation. While the algorithm implemented is general and should work for all cases, I have observed the method to faulter when the floor is large (such as in the case of `shoe2_pc.ply`). Also, in some cases where the angle of perturbation is very large (` > pi`) the algorithm is unable to reorient the floor to the correct position even though it finds the floor correctly.
+
+Poisson mesh requires passing the depth parameter, which alters the granularity of of the 3D reconstruction, finding this depth parameter is important to build a suitable representation but it still cannot create a very appealing reconstruction. Ball pivoting mesh hits any 3 points (and it does not fall through those 3 points) it creates a triangles. This creates a visually sparse representation and it depends on the selection of the radii of the spheres. The alpha shape mesh creates a triangular mesh. This last representation looks visually the best.
+
+Ideally to make better surface reconstruction we could probably use a combination of different reconstruction methods to use the best part from each of them, like the cleanliness of the reconstruction from ball-pivoting while having the continuity of surface from the other two.
+
+For improving upon the reorientation algorithm, I find it very strange that the algorithm is able to find the floor in all cases but sometimes can't find the correct transformation as it should be a straightforwrd task given the surface.
